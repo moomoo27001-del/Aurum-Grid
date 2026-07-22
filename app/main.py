@@ -22,9 +22,12 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # London session focus, same lesson learned from AURUM (Asia session unprofitable)
 SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", 7))
 SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", 16))
+ENABLE_SESSION_FILTER = os.environ.get("ENABLE_SESSION_FILTER", "true").lower() == "true"
 
 
 def in_trading_session() -> bool:
+    if not ENABLE_SESSION_FILTER:
+        return True
     hour = datetime.now(timezone.utc).hour
     return SESSION_START_UTC <= hour < SESSION_END_UTC
 
