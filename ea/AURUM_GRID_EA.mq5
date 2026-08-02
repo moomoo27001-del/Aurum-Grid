@@ -1,13 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                              AURUM_GRID_EA.mq5    |
 //| ML-regime-gated grid EA for XAU/USD.                             |
-//| Pulls grid parameters from the AURUM_GRID FastAPI signal server  |
-//| (Railway-hosted). The EA itself is intentionally "dumb" —        |
-//| all adaptive logic (regime, spacing, lot scaling, bias) lives    |
-//| server-side so it can be retrained/improved without EA changes.  |
+//| v2: adds weekend flatten, EnableTrading defaults to FALSE —      |
+//| re-enable only after demo forward-testing, per the two live      |
+//| losses this version was built to fix.                            |
 //+------------------------------------------------------------------+
 #property copyright "AURUM_GRID"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 input string  SignalServerURL      = "https://your-railway-app.up.railway.app/grid_signal";
@@ -15,7 +14,7 @@ input string  LogTradeURL          = "https://your-railway-app.up.railway.app/lo
 input int     PollIntervalSeconds  = 900;      // check for new grid signal every 15 min
 input int     MagicNumber          = 990011;
 input double  MaxSpreadPoints      = 400;      // safety: skip deployment if spread too wide
-input bool    EnableTrading        = true;
+input bool    EnableTrading        = false;    // DEFAULT OFF — enable only after demo testing
 
 input bool    EnableTelegram       = true;
 input string  TelegramBotToken     = "";       // from @BotFather
@@ -31,6 +30,8 @@ int      spacingAtOpen = 0;
 int OnInit()
   {
    EventSetTimer(PollIntervalSeconds);
+   if(!EnableTrading)
+      Print("AURUM_GRID_EA loaded with EnableTrading=false — dry run only, no orders will be placed.");
    return(INIT_SUCCEEDED);
   }
 
@@ -42,6 +43,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
   {
+   CheckWeekendFlatten();
    ManageOpenBasket();     // check profit target / trail / equity stop first
    if(!HasOpenGridPositions())
       TryDeployGrid();
@@ -49,8 +51,6 @@ void OnTimer()
 
 void OnTick()
   {
-   // Equity stopout needs to be checked on every tick, not just on timer,
-   // since gold can move fast intra-bar.
    CheckEquityStopout();
   }
 
@@ -74,8 +74,7 @@ string FetchGridSignal()
   }
 
 //+------------------------------------------------------------------+
-//| Deploy grid based on server signal (JSON parsing kept minimal —   |
-//| swap in a proper JSON lib e.g. JAson.mqh for production)          |
+//| Deploy grid based on server signal                                |
 //+------------------------------------------------------------------+
 void TryDeployGrid()
   {
@@ -86,7 +85,6 @@ void TryDeployGrid()
 
    if(StringFind(json, "\"action\":\"stand_down\"") >= 0)
      {
-      // regime not favorable / news blackout / outside session — do nothing
       return;
      }
 
@@ -100,7 +98,6 @@ void TryDeployGrid()
       return;
      }
 
-   // --- Parse required fields (replace with real JSON parser) ---
    int spacingPoints   = ParseIntField(json, "spacing_points");
    int maxLevels        = ParseIntField(json, "max_levels");
    double baseLot        = ParseDoubleField(json, "base_lot");
@@ -141,7 +138,7 @@ void TryDeployGrid()
 double CalcScaledLot(double baseLot, int level)
   {
    double scale = 1.0 + (level - 1) * 0.12;
-   if(scale > 1.6) scale = 1.6; // cap — no martingale doubling
+   if(scale > 1.6) scale = 1.6;
    double lot = NormalizeDouble(baseLot * scale, 2);
    return(lot);
   }
@@ -207,7 +204,7 @@ void ManageOpenBasket()
    double floatingProfit = BasketFloatingProfit();
    double profitPct = (floatingProfit / equity) * 100.0;
 
-   double profitTarget = 1.2;   // basket_profit_target_pct — mirror server default
+   double profitTarget = 1.2;
    if(profitPct >= profitTarget)
      {
       CloseAllGridPositions("profit_target");
@@ -222,11 +219,32 @@ void CheckEquityStopout()
    double floatingProfit = BasketFloatingProfit();
    double lossPct = (-floatingProfit / equity) * 100.0;
 
-   double equityStopoutPct = 6.0; // mirror server default — hard kill switch
+   double equityStopoutPct = 6.0;
    if(lossPct >= equityStopoutPct)
      {
       Print("EQUITY STOPOUT triggered at ", lossPct, "% drawdown. Closing basket.");
       CloseAllGridPositions("equity_stopout");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Force-close everything before weekend market close, regardless   |
+//| of P/L — avoids swap fees and weekend gap risk on an open basket.|
+//| NEW in v2, directly fixes the Friday-hold issue.                 |
+//+------------------------------------------------------------------+
+void CheckWeekendFlatten()
+  {
+   if(!HasOpenGridPositions()) return;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+
+   // MQL5 day_of_week: 0=Sunday ... 5=Friday. Adjust hour/min if your
+   // broker's actual weekend close time differs.
+   if(dt.day_of_week == 5 && dt.hour >= 20 && dt.min >= 45)
+     {
+      Print("Weekend approaching — force-closing basket to avoid swap/gap risk.");
+      CloseAllGridPositions("weekend_flatten");
      }
   }
 
@@ -260,7 +278,9 @@ void CloseAllGridPositions(string reason)
 
    LogTradeOutcome(filled, netProfit, reason);
 
-   string prefix = (reason == "equity_stopout") ? "⚠️ EQUITY STOPOUT" : "AURUM_GRID basket closed";
+   string prefix = (reason == "equity_stopout") ? "\u26A0\uFE0F EQUITY STOPOUT" :
+                    (reason == "weekend_flatten") ? "\uD83D\uDCC5 Weekend flatten" :
+                    "AURUM_GRID basket closed";
    SendTelegramMessage(StringFormat("%s | levels=%d | net=%.2f | reason=%s",
                         prefix, filled, netProfit, reason));
   }
@@ -285,7 +305,27 @@ void ClosePositionByTicket(ulong ticket)
   }
 
 //+------------------------------------------------------------------+
-//| Feedback loop: post basket outcome for weekly retraining           |
+//| Telegram notifications                                            |
+//+------------------------------------------------------------------+
+void SendTelegramMessage(string text)
+  {
+   if(!EnableTelegram || TelegramBotToken == "" || TelegramChatID == "") return;
+
+   string url = "https://api.telegram.org/bot" + TelegramBotToken + "/sendMessage";
+   string json = StringFormat("{\"chat_id\":\"%s\",\"text\":\"%s\"}", TelegramChatID, text);
+
+   char post[], result[];
+   string headers = "Content-Type: application/json\r\n";
+   StringToCharArray(json, post, 0, StringLen(json));
+   string resultHeaders;
+
+   int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
+   if(res == -1)
+      Print("Telegram notify failed: ", GetLastError());
+  }
+
+//+------------------------------------------------------------------+
+//| Feedback loop                                                     |
 //+------------------------------------------------------------------+
 void LogTradeOutcome(int levelsFilled, double netProfit, string closeReason)
   {
@@ -307,28 +347,7 @@ void LogTradeOutcome(int levelsFilled, double netProfit, string closeReason)
   }
 
 //+------------------------------------------------------------------+
-//| Telegram notifications — informational only, not in the trading    |
-//| critical path (EA never waits on this before acting)               |
-//+------------------------------------------------------------------+
-void SendTelegramMessage(string text)
-  {
-   if(!EnableTelegram || TelegramBotToken == "" || TelegramChatID == "") return;
-
-   string url = "https://api.telegram.org/bot" + TelegramBotToken + "/sendMessage";
-   string json = StringFormat("{\"chat_id\":\"%s\",\"text\":\"%s\"}", TelegramChatID, text);
-
-   char post[], result[];
-   string headers = "Content-Type: application/json\r\n";
-   StringToCharArray(json, post, 0, StringLen(json));
-   string resultHeaders;
-
-   int res = WebRequest("POST", url, headers, 5000, post, result, resultHeaders);
-   if(res == -1)
-      Print("Telegram notify failed: ", GetLastError());
-  }
-
-//+------------------------------------------------------------------+
-//| Minimal JSON field parsers — replace with JAson.mqh for production|
+//| Minimal JSON field parsers                                        |
 //+------------------------------------------------------------------+
 int ParseIntField(string json, string field)
   {
