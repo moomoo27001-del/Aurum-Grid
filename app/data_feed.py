@@ -1,7 +1,7 @@
 """
 Twelve Data feed wrapper — mirrors the pattern used in AURUM / GAIA.
-Pulls H1 and H4 OHLCV for XAU/USD. Single call per timeframe per signal
-cycle to conserve API credits (lesson learned from TITAN's credit exhaustion).
+Pulls M15, H1, and H4 OHLCV for XAU/USD. M15 was added specifically to
+catch fast intraday moves that the H4-based trend filter is too slow to see.
 """
 import os
 import requests
@@ -34,6 +34,10 @@ def _fetch(interval: str, outputsize: int = 150) -> pd.DataFrame:
         df[col] = df[col].astype(float)
     df = df.sort_values("time").reset_index(drop=True)
     return df
+
+
+def get_m15(outputsize: int = 50) -> pd.DataFrame:
+    return _fetch("15min", outputsize)
 
 
 def get_h1(outputsize: int = 150) -> pd.DataFrame:

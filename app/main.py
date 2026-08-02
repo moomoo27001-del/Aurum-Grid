@@ -2,6 +2,7 @@
 AURUM_GRID signal server.
 Endpoints:
   GET  /health
+  GET  /news_check   -> debug: current news blackout status + upcoming high-impact USD events
   GET  /grid_signal   -> regime + grid parameters for the MT5 EA to consume
   POST /log_trade     -> logs closed basket outcomes for weekly retraining
   POST /log_regime_outcome -> logs realized regime vs predicted (for retrain accuracy tracking)
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from . import data_feed, indicators, regime_model, grid_logic
+from . import data_feed, indicators, regime_model, grid_logic, news_calendar
 
 app = FastAPI(title="AURUM_GRID Signal Server")
 
@@ -24,26 +25,49 @@ SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", 7))
 SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", 16))
 ENABLE_SESSION_FILTER = os.environ.get("ENABLE_SESSION_FILTER", "true").lower() == "true"
 
+# Don't open new grids too close to the weekend — swap fees over a weekend
+# hold, plus gap risk on a still-open basket while markets are closed, can
+# wipe out gains. Friday = weekday 4 (Mon=0) in Python's convention.
+FRIDAY_CUTOFF_HOUR_UTC = int(os.environ.get("FRIDAY_CUTOFF_HOUR_UTC", 12))
+
 
 def in_trading_session() -> bool:
     if not ENABLE_SESSION_FILTER:
         return True
-    hour = datetime.now(timezone.utc).hour
-    return SESSION_START_UTC <= hour < SESSION_END_UTC
+    now = datetime.now(timezone.utc)
+    if now.weekday() == 4 and now.hour >= FRIDAY_CUTOFF_HOUR_UTC:
+        return False  # too close to weekend — don't open new grids
+    return SESSION_START_UTC <= now.hour < SESSION_END_UTC
 
 
 def check_news_blackout() -> bool:
     """
-    Placeholder — wire to FRED / an economic calendar source before going live.
-    Should return True during a blackout window around high-impact releases
-    (NFP, CPI, FOMC) for XAU/USD.
+    Blocks grid deployment ±30 min around high-impact USD economic releases
+    (NFP, CPI, FOMC, etc.) using the Forex Factory weekly calendar feed.
     """
-    return False
+    return news_calendar.is_blackout()
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": regime_model._model is not None}
+
+
+@app.get("/news_check")
+def news_check():
+    """Debug endpoint: shows current blackout status and the raw calendar
+    events being evaluated, so you can verify the feed is working without
+    waiting for an actual news window."""
+    events = news_calendar._fetch_calendar()
+    high_impact_usd = [
+        {"title": e.get("title"), "date": e.get("date"), "impact": e.get("impact")}
+        for e in events
+        if e.get("country") in news_calendar.RELEVANT_CURRENCIES and e.get("impact") == "High"
+    ]
+    return {
+        "is_blackout_now": news_calendar.is_blackout(),
+        "high_impact_usd_events_this_week": high_impact_usd,
+    }
 
 
 @app.get("/grid_signal")
@@ -53,11 +77,12 @@ def grid_signal():
 
     news_blackout = check_news_blackout()
 
+    df_m15 = data_feed.get_m15()
     df_h1 = data_feed.get_h1()
     df_h4 = data_feed.get_h4()
 
-    features = indicators.build_feature_row(df_h1, df_h4)
-    model_features = {k: v for k, v in features.items() if k != "h4_trend"}
+    features = indicators.build_feature_row(df_h1, df_h4, df_m15)
+    model_features = {k: v for k, v in features.items() if k in regime_model.FEATURE_ORDER}
     regime_result = regime_model.predict_regime(model_features)
 
     signal = grid_logic.build_grid_signal(regime_result, features, news_blackout)
@@ -76,7 +101,7 @@ class TradeLog(BaseModel):
     net_profit: float
     regime_at_open: str
     spacing_points: int
-    close_reason: str  # "profit_target" | "trail_stop" | "equity_stopout" | "manual"
+    close_reason: str  # "profit_target" | "trail_stop" | "equity_stopout" | "weekend_flatten" | "manual"
 
 
 @app.post("/log_trade")
@@ -87,8 +112,6 @@ def log_trade(trade: TradeLog):
 
 @app.post("/log_regime_outcome")
 def log_regime_outcome(payload: dict):
-    """EA or a scheduled job posts realized regime (based on forward price action)
-    vs what was predicted, so train_regime.py can measure/improve accuracy."""
     _append_log("regime_outcomes.jsonl", payload)
     return {"status": "logged"}
 

@@ -1,7 +1,6 @@
 """
-Local indicator calculations for AURUM_GRID.
-All computed locally from OHLCV to avoid burning Twelve Data API credits
-(same pattern used in GAIA / AURUM_EA_v3).
+Local indicator calculations for regime detection and grid spacing.
+All computed locally from OHLCV to avoid burning Twelve Data API credits.
 """
 import numpy as np
 import pandas as pd
@@ -24,7 +23,6 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def atr_percentile(df: pd.DataFrame, period: int = 14, lookback: int = 100) -> float:
-    """Where current ATR sits relative to its own recent history (0-100)."""
     atr_series = atr(df, period).dropna()
     if len(atr_series) < lookback:
         lookback = len(atr_series)
@@ -77,7 +75,7 @@ def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def h4_trend_bias(df_h4: pd.DataFrame, fast: int = 20, slow: int = 50) -> str:
-    """Reuses AURUM_EA_v3's H4 trend filter concept. Returns 'up', 'down', 'flat'."""
+    """Slower-moving H4 trend context. Returns 'up', 'down', 'flat'."""
     close = df_h4["close"]
     ema_fast = close.ewm(span=fast).mean().iloc[-1]
     ema_slow = close.ewm(span=slow).mean().iloc[-1]
@@ -89,12 +87,40 @@ def h4_trend_bias(df_h4: pd.DataFrame, fast: int = 20, slow: int = 50) -> str:
     return "flat"
 
 
-def build_feature_row(df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> dict:
-    """Feature vector consumed by the regime classifier."""
+def fast_momentum_pct(df_m15: pd.DataFrame, lookback_bars: int = 12) -> float:
+    """
+    Percent price change over the last `lookback_bars` M15 candles
+    (12 bars = ~3 hours). This is what the H4 EMA filter is too slow to
+    catch — a sharp intraday move can complete entirely within a single
+    H4 candle while showing up clearly here.
+    Positive = up move, negative = down move.
+    """
+    closes = df_m15["close"]
+    if len(closes) < lookback_bars + 1:
+        lookback_bars = len(closes) - 1
+    start_price = closes.iloc[-(lookback_bars + 1)]
+    end_price = closes.iloc[-1]
+    return float((end_price - start_price) / start_price * 100)
+
+
+def fast_trend_bias(momentum_pct: float, threshold_pct: float = 0.35) -> str:
+    """Direction implied by the fast M15 momentum check. 'up'/'down'/'flat'."""
+    if momentum_pct > threshold_pct:
+        return "up"
+    elif momentum_pct < -threshold_pct:
+        return "down"
+    return "flat"
+
+
+def build_feature_row(df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_m15: pd.DataFrame) -> dict:
+    """Feature vector consumed by the regime classifier + fast-move check."""
+    momentum = fast_momentum_pct(df_m15)
     return {
         "adx": float(adx(df_h1).iloc[-1]),
         "atr_pctile": atr_percentile(df_h1),
         "bb_width_pctile": bollinger_band_width_percentile(df_h1),
         "choppiness": float(choppiness_index(df_h1).iloc[-1]),
         "h4_trend": h4_trend_bias(df_h4),
+        "fast_momentum_pct": momentum,
+        "fast_trend": fast_trend_bias(momentum),
     }
